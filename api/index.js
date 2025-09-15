@@ -1,36 +1,28 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const axios = require('axios');
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs-extra');
 const path = require('path');
+const axios = require('axios');
 
 const app = express();
 app.use(express.json());
-app.use(cors()); // Allow all origins
+app.use(cors());
 
-// ------------------------------
-// Telegram Config
-// ------------------------------
+// Telegram config
 const BOT_TOKEN = '8462261408:AAH75k38CJV4ZmrG8ZAnAI6HR7MHtT-SxB8';
-const CHANNEL_ID = -1002897456594; // your private channel ID
+const CHANNEL_ID = -1002897456594;
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-// ------------------------------
 // Temp uploads folder
-// ------------------------------
 const UPLOAD_DIR = '/tmp/uploads';
 fs.ensureDirSync(UPLOAD_DIR);
 
-// ------------------------------
 // Multer config
-// ------------------------------
 const upload = multer({ dest: UPLOAD_DIR });
 
-// ------------------------------
 // Upload endpoint
-// ------------------------------
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     let filePath, fileName;
@@ -53,45 +45,45 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'No file or file_url provided' });
     }
 
-    // Upload file to Telegram channel
+    // Upload to Telegram channel
     const message = await bot.sendDocument(CHANNEL_ID, fs.createReadStream(filePath));
 
-    // Clean up temp file
+    // Clean temp file
     fs.unlinkSync(filePath);
 
-    // Return permanent hotlink using message_id
-    const downloadLink = `https://file-to-link-api-45zb.vercel.app/download/${message.message_id}`;
-    res.json({ file_name: fileName, hotlink: downloadLink });
+    // Generate API permanent download URL dynamically
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.headers.host;
+    const downloadLink = `${protocol}://${host}/download/${message.document.file_id}?filename=${encodeURIComponent(fileName)}`;
 
+    res.json({
+      file_name: fileName,
+      hotlink: downloadLink
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ------------------------------
 // Download endpoint
-// ------------------------------
-app.get('/download/:message_id', async (req, res) => {
+app.get('/download/:file_id', async (req, res) => {
   try {
-    const messageId = req.params.message_id;
+    const fileId = req.params.file_id;
+    const fileName = req.query.filename || 'file';
 
-    // Telegram Bot API does not allow fetching by message_id directly,
-    // but we can use the known message_id as part of our hotlink strategy.
-    // For simplicity, we assume the file exists in the channel.
-    const file = await bot.getFile(messageId).catch(err => {
-      throw new Error('File not found or bot cannot access the channel');
-    });
-
+    // Get Telegram file path
+    const file = await bot.getFile(fileId);
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+
+    // Fetch and stream with proper headers
     const response = await axios.get(fileUrl, { responseType: 'stream' });
-
-    res.setHeader('Content-Disposition', `attachment; filename="${file.file_path.split('/').pop()}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.setHeader('Content-Type', 'application/octet-stream');
     response.data.pipe(res);
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'File not found or cannot download' });
   }
 });
 
