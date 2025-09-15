@@ -1,4 +1,5 @@
 const express = require('express');
+const cors = require('cors'); // <-- Added CORS
 const multer = require('multer');
 const axios = require('axios');
 const fs = require('fs-extra');
@@ -7,6 +8,7 @@ const TelegramBot = require('node-telegram-bot-api');
 
 const app = express();
 app.use(express.json());
+app.use(cors()); // <-- Enable CORS for all domains
 
 // ------------------------------
 // Telegram Config
@@ -75,7 +77,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     fs.unlinkSync(filePath);
 
     // Permanent download link
-    const downloadLink = `https://zerocreation.vercel.app/download/${message.message_id}`;
+    const downloadLink = `https://file-to-link-api.vercel.app/download/${message.message_id}`;
     res.json({ file_name: fileName, hotlink: downloadLink });
 
   } catch (error) {
