@@ -24,20 +24,23 @@ const UPLOAD_DIR = '/tmp/uploads';
 fs.ensureDirSync(UPLOAD_DIR);
 
 // ------------------------
-// Multer Config
+// Multer Config (Large Files)
 // ------------------------
-const upload = multer({ dest: UPLOAD_DIR });
+const upload = multer({
+  dest: UPLOAD_DIR,
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 } // max 2 GB per file for Telegram bot
+});
 
 // ------------------------
-// Helper: sanitize filename
+// Helper: Safe but original filename
 // ------------------------
-function sanitizeFileName(name) {
-  let sanitized = name
-    .replace(/[^a-zA-Z0-9.\-_ ]/g, '') // remove emojis and special chars
-    .replace(/\s+/g, '_') // replace spaces with underscores
-    .slice(0, 60);        // limit length
-  if (!sanitized.includes('.')) sanitized += '.dat'; // fallback extension
-  return sanitized;
+function safeFileName(name) {
+  // Remove only problematic characters for HTTP headers
+  let ext = path.extname(name) || '';
+  let base = path.basename(name, ext)
+                  .replace(/[\n\r"]/g, '_')
+                  .slice(0, 100); // limit base name to 100 chars
+  return base + ext;
 }
 
 // ------------------------
@@ -45,44 +48,24 @@ function sanitizeFileName(name) {
 // ------------------------
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
-    let filePath, fileName;
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-    // Handle file upload
-    if (req.file) {
-      filePath = req.file.path;
-      fileName = req.file.originalname;
-    } 
-    // Handle file URL
-    else if (req.body.file_url) {
-      const url = req.body.file_url;
-      fileName = path.basename(url);
-      const response = await axios.get(url, { responseType: 'stream' });
-      filePath = path.join(UPLOAD_DIR, fileName);
-      const writer = fs.createWriteStream(filePath);
-      response.data.pipe(writer);
-      await new Promise((resolve, reject) => {
-        writer.on('finish', resolve);
-        writer.on('error', reject);
-      });
-    } 
-    else {
-      return res.status(400).json({ error: 'No file or file_url provided' });
-    }
+    const filePath = req.file.path;
+    const originalName = req.file.originalname;
 
-    // Upload file to Telegram channel
+    // Upload file to Telegram
     const message = await bot.sendDocument(CHANNEL_ID, fs.createReadStream(filePath));
 
-    // Clean up temp file
+    // Remove temp file
     fs.unlinkSync(filePath);
 
-    // Generate permanent download link
+    // Permanent download link
     const protocol = req.headers['x-forwarded-proto'] || req.protocol;
     const host = req.headers.host;
-    const sanitizedFileName = sanitizeFileName(fileName);
-    const downloadLink = `${protocol}://${host}/download/${message.document.file_id}?filename=${encodeURIComponent(sanitizedFileName)}`;
+    const downloadLink = `${protocol}://${host}/download/${message.document.file_id}?filename=${encodeURIComponent(originalName)}`;
 
     res.json({
-      file_name: fileName,
+      file_name: originalName,
       hotlink: downloadLink
     });
 
@@ -99,7 +82,7 @@ app.get('/download/:file_id', async (req, res) => {
   try {
     const fileId = req.params.file_id;
     let fileName = req.query.filename || 'file';
-    fileName = sanitizeFileName(fileName);
+    fileName = safeFileName(fileName);
 
     // Get Telegram file info
     const file = await bot.getFile(fileId);
@@ -107,10 +90,17 @@ app.get('/download/:file_id', async (req, res) => {
 
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
 
-    // Stream file with proper download headers
-    const response = await axios.get(fileUrl, { responseType: 'stream' });
+    // Stream file safely
+    const response = await axios.get(fileUrl, {
+      responseType: 'stream',
+      timeout: 0,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity
+    });
+
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
     res.setHeader('Content-Type', 'application/octet-stream');
+
     response.data.pipe(res);
 
   } catch (err) {
