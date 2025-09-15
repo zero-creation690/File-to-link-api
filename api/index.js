@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -5,92 +6,106 @@ const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs-extra');
 const path = require('path');
 const axios = require('axios');
+const { pipeline } = require('stream');
+const util = require('util');
+const streamPipeline = util.promisify(pipeline);
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// ------------------------
-// Telegram Bot Configuration
-// ------------------------
-const BOT_TOKEN = '8462261408:AAH75k38CJV4ZmrG8ZAnAI6HR7MHtT-SxB8';
-const CHANNEL_ID = -1002897456594; // bot must be admin
+// =========================
+// Telegram Bot Config
+// =========================
+const BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN";
+const CHANNEL_ID = -1000000000000; // Replace with your channel ID
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-// ------------------------
-// Temporary Upload Directory
-// ------------------------
+// =========================
+// Temp folder for uploads
+// =========================
 const UPLOAD_DIR = '/tmp/uploads';
 fs.ensureDirSync(UPLOAD_DIR);
 
-// ------------------------
-// Multer Config (Large Files)
-// ------------------------
-const upload = multer({
-  dest: UPLOAD_DIR,
-  limits: { fileSize: 2 * 1024 * 1024 * 1024 } // max 2 GB per file for Telegram bot
-});
+// =========================
+// Multer Config (allow up to 3 files)
+// =========================
+const upload = multer({ dest: UPLOAD_DIR });
 
-// ------------------------
-// Helper: Safe but original filename
-// ------------------------
-function safeFileName(name) {
-  // Remove only problematic characters for HTTP headers
-  let ext = path.extname(name) || '';
-  let base = path.basename(name, ext)
-                  .replace(/[\n\r"]/g, '_')
-                  .slice(0, 100); // limit base name to 100 chars
-  return base + ext;
-}
-
-// ------------------------
-// Upload Endpoint
-// ------------------------
-app.post('/upload', upload.single('file'), async (req, res) => {
+// =========================
+// Upload Endpoint (multiple files)
+// =========================
+app.post('/upload', upload.array('files', 3), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    if ((!req.files || req.files.length === 0) && !req.body.file_urls) {
+      return res.status(400).json({ error: 'No file(s) or file_url(s) provided' });
+    }
 
-    const filePath = req.file.path;
-    const originalName = req.file.originalname;
+    let uploadResults = [];
 
-    // Upload file to Telegram
-    const message = await bot.sendDocument(CHANNEL_ID, fs.createReadStream(filePath));
+    // Handle uploaded files
+    if (req.files && req.files.length > 0) {
+      for (const file of req.files) {
+        const filePath = file.path;
+        const fileName = file.originalname;
 
-    // Remove temp file
-    fs.unlinkSync(filePath);
+        const message = await bot.sendDocument(CHANNEL_ID, fs.createReadStream(filePath));
+        fs.unlinkSync(filePath);
 
-    // Permanent download link
-    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
-    const host = req.headers.host;
-    const downloadLink = `${protocol}://${host}/download/${message.document.file_id}?filename=${encodeURIComponent(originalName)}`;
+        const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+        const host = req.headers.host;
+        const downloadLink = `${protocol}://${host}/download/${message.document.file_id}?filename=${encodeURIComponent(fileName)}`;
 
-    res.json({
-      file_name: originalName,
-      hotlink: downloadLink
-    });
+        uploadResults.push({ file_name: fileName, hotlink: downloadLink });
+      }
+    }
 
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    // Handle file URLs if provided
+    if (req.body.file_urls) {
+      const urls = Array.isArray(req.body.file_urls) ? req.body.file_urls : [req.body.file_urls];
+      for (const url of urls.slice(0, 3)) { // limit 3
+        const fileName = path.basename(url.split('?')[0]);
+        const filePath = path.join(UPLOAD_DIR, fileName);
+
+        const response = await axios.get(url, { responseType: 'stream' });
+        const writer = fs.createWriteStream(filePath);
+        response.data.pipe(writer);
+        await new Promise((resolve, reject) => {
+          writer.on('finish', resolve);
+          writer.on('error', reject);
+        });
+
+        const message = await bot.sendDocument(CHANNEL_ID, fs.createReadStream(filePath));
+        fs.unlinkSync(filePath);
+
+        const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+        const host = req.headers.host;
+        const downloadLink = `${protocol}://${host}/download/${message.document.file_id}?filename=${encodeURIComponent(fileName)}`;
+
+        uploadResults.push({ file_name: fileName, hotlink: downloadLink });
+      }
+    }
+
+    res.json({ uploaded: uploadResults });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// ------------------------
+// =========================
 // Download Endpoint
-// ------------------------
+// =========================
 app.get('/download/:file_id', async (req, res) => {
   try {
     const fileId = req.params.file_id;
-    let fileName = req.query.filename || 'file';
-    fileName = safeFileName(fileName);
+    const fileName = req.query.filename || 'file';
 
-    // Get Telegram file info
     const file = await bot.getFile(fileId);
     if (!file || !file.file_path) throw new Error('File not found');
 
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-
-    // Stream file safely
     const response = await axios.get(fileUrl, {
       responseType: 'stream',
       timeout: 0,
@@ -101,7 +116,7 @@ app.get('/download/:file_id', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
     res.setHeader('Content-Type', 'application/octet-stream');
 
-    response.data.pipe(res);
+    await streamPipeline(response.data, res);
 
   } catch (err) {
     console.error(err);
